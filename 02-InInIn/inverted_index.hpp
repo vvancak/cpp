@@ -11,53 +11,52 @@
 #include <condition_variable>
 
 namespace ii {
-    namespace {
-        namespace compression_helpers {
-            // Data Compression - each byte consists of :
-            // - 1 bit marks, if the value should be appended to the previous byte
-            // - 7 bits of value
+    namespace compression_helpers {
+        // Data Compression - each byte consists of :
+        // - 1 bit marks, if the value should be appended to the previous byte
+        // - 7 bits of value
 
-            const uint8_t BITMASK_HAS_NEXT = 0x80;
-            const uint8_t BITMASK_LAST_7_BITS = 0x7F;
-            const uint8_t BITMASK_NOT_NEXT = 0x00;
+        const uint8_t BITMASK_HAS_NEXT = 0x80;
+        const uint8_t BITMASK_LAST_7_BITS = 0x7F;
+        const uint8_t BITMASK_NOT_NEXT = 0x00;
 
-            uint64_t store_next(uint64_t last_value, uint64_t value, uint8_t *data_ptr) {
-                uint64_t byte_count = 0;
-                uint8_t tag_continue = BITMASK_NOT_NEXT;
+        uint64_t store_next(uint64_t last_value, uint64_t value, uint8_t *data_ptr) {
+            uint64_t byte_count = 0;
+            uint8_t tag_continue = BITMASK_NOT_NEXT;
 
-                value -= last_value;
-                while (value > 0) {
-                    auto last_7_bits = uint8_t(value & BITMASK_LAST_7_BITS);
+            value -= last_value;
+            while (value > 0) {
+                auto last_7_bits = uint8_t(value & BITMASK_LAST_7_BITS);
 
-                    *data_ptr = tag_continue | last_7_bits;
-                    value = value >> 7u;
+                *data_ptr = tag_continue | last_7_bits;
+                value = value >> 7u;
 
-                    ++data_ptr;
-                    ++byte_count;
-                    tag_continue = BITMASK_HAS_NEXT;
-                }
-
-                return byte_count;
+                ++data_ptr;
+                ++byte_count;
+                tag_continue = BITMASK_HAS_NEXT;
             }
 
-            uint64_t get_byte_count(const uint8_t *data_ptr) {
-                uint64_t bc = 1;
-                for (auto i = 1; *(data_ptr + i) > BITMASK_HAS_NEXT; ++i) ++bc;
-                return bc;
-            }
-
-            uint64_t get_next(uint64_t last_value, const uint8_t *data_ptr) {
-                uint64_t value = 0;
-
-                for (uint32_t i = 0; i < get_byte_count(data_ptr); ++i) {
-                    uint64_t next_byte = *(data_ptr + i) & BITMASK_LAST_7_BITS;
-                    value = value | (next_byte << (i * 7));
-                }
-
-                return last_value + value;
-            }
+            return byte_count;
         }
 
+        uint64_t get_byte_count(const uint8_t *data_ptr) {
+            uint64_t bc = 1;
+            for (auto i = 1; *(data_ptr + i) > BITMASK_HAS_NEXT; ++i) ++bc;
+            return bc;
+        }
+
+        uint64_t get_next(uint64_t last_value, const uint8_t *data_ptr) {
+            uint64_t value = 0;
+
+            for (uint32_t i = 0; i < get_byte_count(data_ptr); ++i) {
+                uint64_t next_byte = *(data_ptr + i) & BITMASK_LAST_7_BITS;
+                value = value | (next_byte << (i * 7));
+            }
+
+            return last_value + value;
+        }
+    } // namespace compression_helpers
+    namespace {
         typedef uint64_t DocumentId;
         typedef uint64_t FeatureId;
 
@@ -77,7 +76,7 @@ namespace ii {
                 struct iterator : public std::iterator<
                         std::input_iterator_tag,    // iterator_category
                         const DocumentId,           // value_type
-                        uint64_t,                   // difference_type
+                        int64_t,                    // difference_type
                         const DocumentId *,         // pointer
                         const DocumentId &          // reference
                 > {
@@ -271,9 +270,11 @@ namespace ii {
 
         private:
             const Storage &features;
-            uint64_t unprocessed_buffers;
+
             std::mutex queue_mutex;
-            std::condition_variable condition_variable;
+            std::condition_variable queue_condition_variable;
+
+            std::atomic<int32_t> unprocessed_buffers;
             std::queue<Storage::FeatureDocuments> processing_queue;
 
             Storage::FeatureDocuments merge(
@@ -309,16 +310,15 @@ namespace ii {
                     Storage::FeatureDocuments first_buffer;
                     Storage::FeatureDocuments second_buffer;
 
+                    // Each run would want to remove 2 buffers and to add 1 => -1 in total
+                    // End the cycle if not enough unprocessed buffers remain (atomic + signed counter !!)
+                    if (--unprocessed_buffers < 1) break;
+
                     // === LOCK ===
                     std::unique_lock lock(queue_mutex);
-                    while (processing_queue.size() < 2) {
 
-                        // End if just one buffer remains (i.e. result)
-                        if (unprocessed_buffers == 1) goto outer_while_end;
-
-                        // Wait for more elments
-                        condition_variable.wait(lock);
-                    }
+                    // Wait for more elments
+                    while (processing_queue.size() < 2) queue_condition_variable.wait(lock);
 
                     // Get to-merge lists
                     first_buffer = processing_queue.front();
@@ -326,9 +326,6 @@ namespace ii {
 
                     second_buffer = processing_queue.front();
                     processing_queue.pop();
-
-                    // We have removed 2 buffers and we will add 1 => just -1 unprocessed
-                    --unprocessed_buffers;
 
                     // === UNLOCK ===
                     lock.unlock();
@@ -341,12 +338,8 @@ namespace ii {
                         std::lock_guard guard(queue_mutex);
                         processing_queue.push(std::move(result));
                     }
-                    condition_variable.notify_one();
+                    queue_condition_variable.notify_one();
                 }
-                outer_while_end:
-
-                // Processing end (for at least one thread) => Notify all other waiting threads to terminate themselves
-                condition_variable.notify_all();
             }
         };
     }; // namespace
