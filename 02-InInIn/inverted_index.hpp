@@ -12,10 +12,7 @@
 
 namespace ii {
     namespace {
-        typedef uint64_t DocumentId;
-        typedef uint64_t FeatureId;
-
-        namespace CompressionHelpers {
+        namespace compression_helpers {
             // Data Compression - each byte consists of :
             // - 1 bit marks, if the value should be appended to the previous byte
             // - 7 bits of value
@@ -24,24 +21,23 @@ namespace ii {
             const uint8_t BITMASK_LAST_7_BITS = 0x7F;
             const uint8_t BITMASK_NOT_NEXT = 0x00;
 
-            uint64_t store_next(const DocumentId &last, DocumentId next, uint8_t *data_ptr) {
-                uint64_t bit_count = 0;
+            uint64_t store_next(uint64_t last_value, uint64_t value, uint8_t *data_ptr) {
+                uint64_t byte_count = 0;
                 uint8_t tag_continue = BITMASK_NOT_NEXT;
 
-                uint64_t value = next - last;
-
+                value -= last_value;
                 while (value > 0) {
                     auto last_7_bits = uint8_t(value & BITMASK_LAST_7_BITS);
 
                     *data_ptr = tag_continue | last_7_bits;
-                    value = value >> 7;
+                    value = value >> 7u;
 
                     ++data_ptr;
-                    ++bit_count;
+                    ++byte_count;
                     tag_continue = BITMASK_HAS_NEXT;
                 }
 
-                return bit_count;
+                return byte_count;
             }
 
             uint64_t get_byte_count(const uint8_t *data_ptr) {
@@ -50,110 +46,125 @@ namespace ii {
                 return bc;
             }
 
-            uint64_t get_next(const uint64_t &last_document_id, uint8_t *data_ptr) {
+            uint64_t get_next(uint64_t last_value, const uint8_t *data_ptr) {
                 uint64_t value = 0;
 
-                for (auto i = 0; i < get_byte_count(data_ptr); ++i) {
+                for (uint32_t i = 0; i < get_byte_count(data_ptr); ++i) {
                     uint64_t next_byte = *(data_ptr + i) & BITMASK_LAST_7_BITS;
-                    value = value | next_byte << (i * 7);
+                    value = value | (next_byte << (i * 7));
                 }
-                return last_document_id + value;
+
+                return last_value + value;
             }
         }
+
+        typedef uint64_t DocumentId;
+        typedef uint64_t FeatureId;
 
         class Storage {
         public:
             class FeatureDocuments {
             public:
-                FeatureDocuments() {}
+                FeatureDocuments() = default;
 
-                FeatureDocuments(Storage *storage, FeatureId feature_id) : storage(storage),
-                                                                           feature_id(feature_id) {}
+                FeatureDocuments(const Storage *const storage, FeatureId feature_id) : storage(storage),
+                                                                                       feature_id(feature_id) {}
 
-                FeatureDocuments(std::vector<DocumentId> &&vct) : storage(),
-                                                                  feature_id(),
-                                                                  documents_vector(vct) {}
+                explicit FeatureDocuments(std::vector<DocumentId> &&vct) : storage(),
+                                                                           feature_id(),
+                                                                           documents_vector(vct) {}
 
-                struct Iterator {
-                    Iterator(uint8_t *data_start) : data_ptr(data_start),
-                                                    last_document(0),
-                                                    buffer_iterator() {}
+                struct iterator : public std::iterator<
+                        std::input_iterator_tag,    // iterator_category
+                        const DocumentId,           // value_type
+                        uint64_t,                   // difference_type
+                        const DocumentId *,         // pointer
+                        const DocumentId &          // reference
+                > {
+                    explicit iterator(const uint8_t *const data_start) : data_ptr(data_start),
+                                                                         last_document_id(0),
+                                                                         buffer_iterator() {
+                        curr_document_id = compression_helpers::get_next(last_document_id, data_ptr);
+                    }
 
-                    Iterator(std::vector<DocumentId>::iterator &&buffer_iterator) :
+                    explicit iterator(std::vector<DocumentId>::const_iterator &&buffer_iterator) :
                             data_ptr(),
-                            last_document(0),
+                            last_document_id(0),
+                            curr_document_id(0),
                             buffer_iterator(buffer_iterator) {}
 
-                    Iterator &operator++() {
+                    iterator &operator++() {
                         if (data_ptr) {
-                            last_document = CompressionHelpers::get_next(last_document, data_ptr);
-                            data_ptr += CompressionHelpers::get_byte_count(data_ptr);
+                            last_document_id = curr_document_id;
+                            data_ptr += compression_helpers::get_byte_count(data_ptr);
+                            curr_document_id = compression_helpers::get_next(last_document_id, data_ptr);
                         } else {
                             buffer_iterator++;
                         }
                         return *this;
                     }
 
-                    Iterator operator++(int) {
-                        Iterator i = *this;
+                    const iterator operator++(int) {
+                        iterator i = *this;
                         if (data_ptr) {
-                            last_document = CompressionHelpers::get_next(last_document, data_ptr);
-                            data_ptr += CompressionHelpers::get_byte_count(data_ptr);
+                            last_document_id = curr_document_id;
+                            data_ptr += compression_helpers::get_byte_count(data_ptr);
+                            curr_document_id = compression_helpers::get_next(last_document_id, data_ptr);
                         } else {
                             buffer_iterator++;
                         }
                         return i;
                     }
 
-                    DocumentId operator*() {
-                        if (data_ptr) return CompressionHelpers::get_next(last_document, data_ptr);
+                    const DocumentId &operator*() const {
+                        if (data_ptr) return curr_document_id;
                         else return *buffer_iterator;
-
                     }
 
-                    bool operator==(const Iterator &rhs) {
-                        return data_ptr == rhs.data_ptr && buffer_iterator == rhs.buffer_iterator;
+                    bool operator==(const iterator &other) const {
+                        return data_ptr == other.data_ptr && buffer_iterator == other.buffer_iterator;
                     }
 
-                    bool operator!=(const Iterator &rhs) {
-                        return data_ptr != rhs.data_ptr || buffer_iterator != rhs.buffer_iterator;
+                    bool operator!=(const iterator &other) const {
+                        return data_ptr != other.data_ptr || buffer_iterator != other.buffer_iterator;
                     }
 
                 private:
-                    std::uint8_t *data_ptr;
-                    DocumentId last_document;
-                    std::vector<DocumentId>::iterator buffer_iterator;
+                    const std::uint8_t *data_ptr;
+                    DocumentId curr_document_id;
+                    DocumentId last_document_id;
+                    std::vector<DocumentId>::const_iterator buffer_iterator;
                 };
 
-                Iterator begin() {
+                iterator begin() const {
                     if (storage) {
-                        auto *entry = storage->get<Entry>(feature_id);
-                        auto *first_document = storage->get<uint8_t>(entry->document_offset);
-                        return Iterator(first_document);
+                        auto *entry = storage->get_const_ptr<Entry>(feature_id);
+                        auto *first_document = storage->get_const_ptr<uint8_t>(entry->document_offset);
+                        return iterator(first_document);
                     } else {
-                        return Iterator(documents_vector.begin());
+                        return iterator(documents_vector.cbegin());
                     }
                 }
 
-                Iterator end() {
+                iterator end() const {
                     if (storage) {
-                        auto *entry = storage->get<Entry>(feature_id);
-                        auto *behind_last = storage->get<uint8_t>(entry->document_offset + entry->count);
-                        return Iterator(behind_last);
+                        auto *entry = storage->get_const_ptr<Entry>(feature_id);
+                        auto *behind_last = storage->get_const_ptr<uint8_t>(entry->document_offset + entry->count);
+                        return iterator(behind_last);
                     } else {
-                        return Iterator(documents_vector.end());
+                        return iterator(documents_vector.cend());
                     }
                 }
 
             private:
-                FeatureId feature_id;
-                Storage *storage;
+                const Storage *storage = nullptr;
+                FeatureId feature_id = 0;
                 std::vector<DocumentId> documents_vector;
             };
 
-            Storage(const uint64_t *data_file_ptr) : data_ptr(data_file_ptr) {}
+            explicit Storage(const uint64_t *data_start) : data_ptr(data_start) {}
 
-            FeatureDocuments operator[](FeatureId id) {
+            const FeatureDocuments operator[](FeatureId id) const {
                 return FeatureDocuments(this, id);
             }
 
@@ -165,36 +176,36 @@ namespace ii {
             };
 
             template<typename T>
-            T *get(uint64_t offset) {
-                return static_cast<T *>(const_cast<void *>(data_ptr)) + offset;
+            const T *get_const_ptr(uint64_t offset) const {
+                return static_cast<const T *>(data_ptr) + offset;
             }
 
             const void *data_ptr;
         };
 
-        class Writer : Storage {
+        class Writer : private Storage {
         public:
-            static uint64_t get_maximum_datafile_size(uint64_t feature_count, uint64_t total_data) {
+            static uint64_t get_maximum_datafile_size(const uint64_t feature_count, const uint64_t total_data) {
                 return (sizeof(Entry) * feature_count) + (sizeof(DocumentId) * total_data);
             }
 
-            Writer(const uint64_t *data_file_ptr, uint64_t feature_count) :
-                    Storage(data_file_ptr),
+            Writer(uint64_t *const data_start, const uint64_t feature_count) :
+                    Storage(data_start),
                     feature_count(feature_count) {
                 next_document_offset = (feature_count * sizeof(Entry));
             }
 
             template<typename IT>
-            void persist(FeatureId id, IT &&documents) {
-                auto *next_document = get<uint8_t>(next_document_offset);
-
+            void persist(const FeatureId id, IT &&documents) {
                 uint64_t total_bits = 0;
                 uint64_t last_document_id = 0;
+
+                auto *next_data = get_ptr<uint8_t>(next_document_offset);
                 for (DocumentId &&document_id : documents) {
-                    uint64_t bit_count = CompressionHelpers::store_next(last_document_id, document_id, next_document);
+                    auto bit_count = compression_helpers::store_next(last_document_id, document_id, next_data);
 
                     last_document_id = document_id;
-                    next_document += bit_count;
+                    next_data += bit_count;
                     total_bits += bit_count;
                 }
 
@@ -209,30 +220,41 @@ namespace ii {
             }
 
             void flush() {
-                auto *next_entry = get<Entry>(next_entry_offset);
+                auto *next_entry = get_ptr<Entry>(next_entry_offset);
+
                 for (Entry &fe : unflushed_entries) {
                     ++next_entry_offset;
                     *(next_entry++) = fe;
                 }
+
                 unflushed_entries.clear();
             }
 
         private:
+            template<typename T>
+            T *get_ptr(uint64_t offset) const {
+                auto *data_ptr = get_const_ptr<T>(offset);
+                return const_cast<T *>(data_ptr);
+            }
+
             const size_t BUFFER_SIZE = 20;
 
             uint64_t feature_count = 0;
             uint64_t next_entry_offset = 0;
             uint64_t next_document_offset = 0;
-            std::vector<Entry> unflushed_entries{};
+            std::vector<Entry> unflushed_entries;
         };
 
         class Processor {
         public:
-            Processor(Storage &storage) : storage(storage) {}
+            explicit Processor(const Storage &features) : features(features), unprocessed_buffers(0) {}
 
             template<typename FS>
             Storage::FeatureDocuments search(FS &&query_features) {
-                for (auto &&feature_id : query_features) processing_queue.push(storage[feature_id]);
+                for (auto &&feature_id : query_features) {
+                    processing_queue.push(features[feature_id]);
+                    ++unprocessed_buffers;
+                }
 
                 const uint32_t hw_thread_count = std::thread::hardware_concurrency();
                 const uint32_t process_threads = hw_thread_count < 8 ? hw_thread_count : 8;
@@ -248,13 +270,16 @@ namespace ii {
             }
 
         private:
-            Storage &storage;
-            uint64_t processing = 0;
+            const Storage &features;
+            uint64_t unprocessed_buffers;
             std::mutex queue_mutex;
             std::condition_variable condition_variable;
             std::queue<Storage::FeatureDocuments> processing_queue;
 
-            Storage::FeatureDocuments merge(Storage::FeatureDocuments &first, Storage::FeatureDocuments &second) {
+            Storage::FeatureDocuments merge(
+                    const Storage::FeatureDocuments &first,
+                    const Storage::FeatureDocuments &second
+            ) {
                 std::vector<DocumentId> result_vector;
 
                 auto it_first = first.begin();
@@ -264,7 +289,7 @@ namespace ii {
 
                     // Equal => result
                     if (*it_first == *it_second) {
-                        result_vector.push_back(*it_first);
+                        result_vector.push_back((*it_first));
                         ++it_first;
                         ++it_second;
                     }
@@ -284,11 +309,12 @@ namespace ii {
                     Storage::FeatureDocuments first_buffer;
                     Storage::FeatureDocuments second_buffer;
 
+                    // === LOCK ===
                     std::unique_lock lock(queue_mutex);
                     while (processing_queue.size() < 2) {
 
-                        // END
-                        if (processing == 0) goto outer_while_end;
+                        // End if just one buffer remains (i.e. result)
+                        if (unprocessed_buffers == 1) goto outer_while_end;
 
                         // Wait for more elments
                         condition_variable.wait(lock);
@@ -301,18 +327,19 @@ namespace ii {
                     second_buffer = processing_queue.front();
                     processing_queue.pop();
 
-                    // Synchronization - processing start
-                    ++processing;
+                    // We have removed 2 buffers and we will add 1 => just -1 unprocessed
+                    --unprocessed_buffers;
+
+                    // === UNLOCK ===
                     lock.unlock();
 
                     // Process
-                    Storage::FeatureDocuments result = merge(first_buffer, second_buffer);
+                    auto result = merge(first_buffer, second_buffer);
 
                     // Store
                     {
                         std::lock_guard guard(queue_mutex);
                         processing_queue.push(std::move(result));
-                        --processing;
                     }
                     condition_variable.notify_one();
                 }
@@ -326,6 +353,7 @@ namespace ii {
 
     template<typename Truncate, typename FeatureObjectLists>
     void create(Truncate &&truncate, FeatureObjectLists &&features) {
+
         // Get data file size
         uint64_t total_data = 0;
         for (uint64_t i = 0; i < features.size(); ++i) {
