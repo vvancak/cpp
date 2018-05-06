@@ -3,302 +3,273 @@
 
 // Vladislav Vancak
 
-#include "block_provider.hpp"
-#include <list>
-#include <memory>
+#include<map>
+#include<list>
+#include"block_provider.hpp"
 
 template<typename TKey, typename TValue>
 class isam {
 public:
-    /* struct pseudo_pair {
-         TKey first;
-         TValue second;
-     };
+    class iterator;
 
-     class isam_iter {
+    isam(size_t block_size, size_t overflow_size) :
+            block_size(block_size),
+            overflow_size(overflow_size),
+            file_block_map{},
+            overflow{} {}
 
-         isam_iter &operator++() {}
+    TValue &operator[](const TKey &key) {
+        key_interval ki(key);
+        return get_single_key_interval(ki);
+    }
 
-         const isam_iter operator++(int) {}
+    TValue &operator[](TKey &&key) {
+        key_interval ki(key);
+        return get_single_key_interval(ki);
+    }
 
-         pseudo_pair &operator*() {}
+    iterator begin();
 
-         pseudo_pair *operator->() {}
+    iterator end();
 
-         bool operator==(const pseudo_pair &other) const {}
+private:
+    typedef std::pair<TKey, TValue> key_value_pair;
 
-         bool operator!=(const pseudo_pair &other) const {}
-     };
-
-     isam(size_t block_size, size_t overflow_size) {}
-
-     TValue &operator[](TKey key) {}
-
-     isam_iter begin() {
-         return isam_iter();
-     }
-
-     isam_iter end() {
-         return isam_iter();
-     }
-
-     */
-    class index_tree {
+    class file_block {
     public:
-        void insert_key(TKey &&key_lower, TKey &&key_upper, size_t block_id) {
-            auto *tn = new node();
+        file_block *next = 0;
 
-            tn->key_lower = key_lower;
-            tn->key_upper = key_upper;
-            tn->block_id = block_id;
+        file_block() = default;
 
-            // insert as new root
-            if (!root) {
-                tn->parent = nullptr;
-                tn->rb_colour = colour::BLACK;
-                root = tn;
-                return;
-            }
-
-            // find
-            node *parent = find(tn->key_lower, tn->key_upper);
-            tn->parent = parent;
-            tn->rb_colour = colour::RED;
-
-            // insert
-            if (key_upper < parent->key_lower) parent->left = tn;
-            else parent->right = tn;
-
-            // repair
-            fix_tree(tn);
+        explicit file_block(isam *const parent) :
+                current_size(0),
+                isam_members(parent) {
+            block_id = block_provider::create_block(isam_members->block_size * sizeof(key_value_pair));
         }
 
-        void delete_key(TKey &&key) {}
+        void load() {
+            values = static_cast<key_value_pair *>(block_provider::load_block(block_id));
+        }
 
-        const size_t get_block_id(TKey &&key) const {
-            node *current = root;
-            while (true) {
-                if (current->left && key < current->key_lower) current = current->left;
-                else if (current->right && current->key_upper < key) current = current->right;
-                else break;
+        void store() const {
+            auto *block_ptr = static_cast<void *>(values);
+            block_provider::store_block(block_id, block_ptr);
+        }
+
+        void free() const {
+            block_provider::free_block(block_id);
+        }
+
+        const TKey &get_min_key() const {
+            return values[0].first;
+        }
+
+        const TKey &get_max_key() const {
+            return values[current_size - 1].first;
+        }
+
+        const size_t get_max_index() const {
+            return current_size;
+        }
+
+        const size_t get_block_id() const {
+            return block_id;
+        }
+
+        int32_t find(const TKey &key) const {
+            int32_t upper = current_size - 1;
+            int32_t lower = 0;
+
+            while (upper > lower) {
+                int32_t index = (upper + lower) / 2;
+                TKey current_key = values[index].first;
+
+                if (key < current_key) upper = index - 1;
+                else if (current_key < key) lower = index + 1;
+                else return index;
             }
-            return current->block_id;
+
+            if (!(values[lower].first < key) && !(key < values[lower].first)) return lower;
+            else return -1;
+        }
+
+        TValue &operator[](size_t index) {
+            return values[index].second;
+        }
+
+        void merge_overflow(std::map<TKey, TValue> &overflow) {
+            const size_t max_size = isam_members->block_size;
+
+            // Create a file_block_map with current values
+            std::map<TKey, TValue> block_values;
+            for (size_t i = 0; i < current_size; ++i) {
+                block_values.emplace(values[i]);
+            }
+
+            // Merge with overflow
+            while (true) {
+                std::cout << "REMOVE: merge" << std::endl;
+
+                // can push more values => emplace values from overflow
+                if (current_size <= max_size && overflow.size() > 0) {
+                    block_values.emplace(*overflow.begin());
+                    overflow.erase(overflow.begin());
+
+                    ++current_size;
+                }
+
+                // too much values => move max to overflow
+                if (current_size > max_size) {
+                    overflow.emplace(*(--block_values.end()));
+                    block_values.erase(--block_values.end());
+                    --current_size;
+                }
+
+                // empty overflow
+                if (overflow.size() == 0) break;
+
+                // order check
+                if ((--block_values.end())->first < overflow.begin()->first) break;
+            }
+
+            // Store values
+            size_t idx = 0;
+            for (auto &&kvp : block_values) {
+                values[idx++] = kvp;
+            }
         }
 
     private:
-        enum colour {
-            RED, BLACK
-        };
-        struct node {
-            TKey key_upper;
-            TKey key_lower;
+        isam *isam_members = 0;
+        size_t block_id = 0;
+        size_t current_size = 0;
+        key_value_pair *values{};
+    };
 
-            size_t block_id = 0;
-            colour rb_colour = colour::RED;
+    struct key_interval {
+        key_interval() = default;
 
-            node *parent = nullptr;
-            node *left = nullptr;
-            node *right = nullptr;
-        };
+        explicit key_interval(TKey &&key) : min_key(key), max_key(min_key) {}
 
-        node *root = nullptr;
+        explicit key_interval(const TKey &key) : min_key(key), max_key(key) {}
 
-        node *find(const TKey &key_lower, const TKey &key_upper) const {
-            node *current = root;
-            while (true) {
-                if (current->left && key_upper < current->key_lower) current = current->left;
-                else if (current->right && current->key_upper < key_lower) current = current->right;
-                else return current;
-            }
-        }
+        key_interval(const TKey &min, const TKey &max) : min_key(min), max_key(max) {}
 
-        node *get_uncle(node *current) {
-            node *parent = current->parent;
-            node *grand_parent = parent->parent;
-            if (parent == grand_parent->left) return grand_parent->right;
-            else return grand_parent->left;
-        }
+        TKey min_key;
+        TKey max_key;
+    };
 
-        colour get_colour(node *node) {
-            if (!node) return colour::BLACK;
-            else return node->rb_colour;
-        }
-
-        void fix_tree(node *current) {
-            while (true) {
-                // no parent => root
-                node *parent = current->parent;
-                if (!parent) {
-                    current->rb_colour = colour::BLACK;
-                    root = current;
-                    return;
-                }
-
-                // no grand parent => parent is root
-                node *grand_parent = parent->parent;
-                if (!grand_parent) {
-                    parent->rb_colour = colour::BLACK;
-                    root = parent;
-                    return;
-                }
-
-                // everything OK
-                if (current->rb_colour == colour::BLACK) return;
-                if (parent->rb_colour == colour::BLACK) return;
-
-                // red uncle
-                node *uncle = get_uncle(current);
-                if (get_colour(uncle) == colour::RED) {
-                    current = recolour(current, uncle);
-                }
-
-                    // black uncle
-                else if (parent == grand_parent->left) {
-                    if (current == parent->left) current = rotate_LL(current);
-                    else current = rotate_LR(current);
-                }
-
-                else {
-                    if (current == parent->left) current = rotate_RL(current);
-                    else current = rotate_RR(current);
-                }
-            }
-        }
-
-        node *recolour(node *current, node *uncle) {
-            node *parent = current->parent;
-            node *grand_parent = parent->parent;
-
-            grand_parent->rb_colour = colour::RED;
-            parent->rb_colour = colour::BLACK;
-            uncle->rb_colour = colour::BLACK;
-
-            return grand_parent;
-        }
-
-        node *rotate_LL(node *x) {
-            node *p = x->parent;
-            node *g = p->parent;
-
-            // Right subtree of P to the left subtree of G
-            g->left = p->right;
-            if (g->left) g->left->parent = g;
-
-            // P is the subtree root
-            p->parent = g->parent;
-            if (g->parent) {
-                if (g == g->parent->left) g->parent->left = p;
-                else g->parent->right = p;
-            }
-
-            // P right is G
-            p->right = g;
-            g->parent = p;
-
-            // Colour changes
-            p->rb_colour = colour::BLACK;
-            g->rb_colour = colour::RED;
-
-            return p;
-        }
-
-        node *rotate_LR(node *x) {
-            node *p = x->parent;
-            node *g = p->parent;
-
-            // Left subtree of X to the right subtree of P
-            p->right = x->left;
-            if (p->right) p->right->parent = p;
-
-            // Right subtree of X to the left subtree of G
-            g->left = x->right;
-            if (g->left) g->left->parent = g;
-
-            // X is the new subtree root
-            x->parent = g->parent;
-            if (g->parent) {
-                if (g == g->parent->left) g->parent->left = x;
-                else g->parent->right = x;
-            }
-
-            // X left is P
-            x->left = p;
-            p->parent = x;
-
-            // X right is G
-            x->right = g;
-            g->parent = x;
-
-            // Colour changes
-            x->rb_colour = colour::BLACK;
-            g->rb_colour = colour::RED;
-
-            return x;
-        }
-
-        node *rotate_RR(node *x) {
-            node *p = x->parent;
-            node *g = p->parent;
-
-            // Left subtree of P into right subtree of G
-            g->right = p->left;
-            if (g->right) g->right->parent = g;
-
-            // P is the subtree root
-            p->parent = g->parent;
-            if (g->parent) {
-                if (g == g->parent->left) g->parent->left = p;
-                else g->parent->right = p;
-            }
-
-            // P right is G
-            p->left = g;
-            g->parent = p;
-
-            // Colour change
-            p->rb_colour = colour::BLACK;
-            g->rb_colour = colour::RED;
-
-            return p;
-        }
-
-        node *rotate_RL(node *x) {
-            node *p = x->parent;
-            node *g = p->parent;
-
-            // Left subtree of X into right subtree of G
-            g->right = x->left;
-            if (g->right) g->right->parent = g;
-
-            // Right subtree of X into left subtree of P
-            p->left = x->right;
-            if (p->left) p->left->parent = p;
-
-            // X is the subtree root
-            x->parent = g->parent;
-            if (g->parent) {
-                if (g == g->parent->left) g->parent->left = x;
-                else g->parent->right = x;
-            }
-
-            // X left is G
-            x->left = g;
-            g->parent = x;
-
-            // X right is P
-            x->right = p;
-            p->parent = x;
-
-            // rb_colour change
-            x->rb_colour = colour::BLACK;
-            g->rb_colour = colour::RED;
-
-            return x;
+    struct key_interval_comparator {
+        bool operator()(const key_interval &first, const key_interval &second) const {
+            return first.max_key < second.min_key;
         }
     };
 
-    //std::list<size_t> file_blocks;
-    //std::list<pseudo_pair> overflow;
+    const size_t block_size;
+
+    const size_t overflow_size;
+
+    std::map<key_interval, file_block, key_interval_comparator> file_block_map;
+
+    std::map<TKey, TValue> overflow;
+
+    void check_flush_overflow() {
+        if (overflow.size() < overflow_size) return;
+
+        auto block_map_iterator = file_block_map.begin();
+        file_block *previous = nullptr;
+
+        while (overflow.size() > 0) {
+            file_block fb;
+
+            if (block_map_iterator != file_block_map.end()) {
+                fb = block_map_iterator->second;
+                file_block_map.erase(block_map_iterator);
+            }
+            else {
+                fb = file_block(this);
+                if (previous) previous->next = &fb;
+                previous = &fb;
+            }
+
+            fb.load();
+            fb.merge_overflow(overflow);
+            fb.store();
+
+            auto entry = std::make_pair(key_interval(fb.get_min_key(), fb.get_max_key()), fb);
+            auto insert_result = file_block_map.insert(entry);
+            block_map_iterator = ++insert_result.first;
+        }
+    }
+
+    TValue &get_single_key_interval(const key_interval &ki) {
+        check_flush_overflow();
+
+        // File Block lookup
+        auto file_block_iterator = file_block_map.find(ki);
+
+        // No entry => Overflow
+        if (file_block_iterator == file_block_map.end()) return overflow[ki.min_key];
+
+        // Load file block
+        file_block *currently_loaded_file_block = &(file_block_iterator->second);
+        currently_loaded_file_block->load();
+
+        // Get value
+        auto index = currently_loaded_file_block->find(ki.min_key);
+        if (index < 0) return overflow[ki.min_key];
+        else return (*currently_loaded_file_block)[index];
+    }
+
+};
+
+template<typename TKey, typename TValue>
+class isam<TKey, TValue>::iterator {
+public:
+    enum MODE {
+        BEGIN, END
+    };
+
+    iterator() = default;
+
+    iterator(isam<TKey, TValue>::file_block *block, MODE mode) : inner_block(block) {}
+
+    iterator &operator++() {
+        iterator it;
+        return it;
+    }
+
+    const iterator operator++(int) {
+        iterator it;
+        return it;
+    }
+
+    isam<TKey, TValue>::key_value_pair &operator*() {}
+
+    isam<TKey, TValue>::key_value_pair *operator->() {}
+
+    bool operator==(const iterator &other) const {
+        return (inner_block->get_block_id() == other.inner_block->get_block_id()
+                && index == other.index);
+    }
+
+    bool operator!=(const iterator &other) const {
+        return !operator==(other);
+    }
+
+private:
+    isam<TKey, TValue>::file_block *inner_block;
+    size_t index;
+};
+
+template<typename TKey, typename TValue>
+typename isam<TKey, TValue>::iterator isam<TKey, TValue>::begin() {
+    return isam<TKey, TValue>::iterator(nullptr, iterator::MODE::BEGIN);
+};
+
+template<typename TKey, typename TValue>
+typename isam<TKey, TValue>::iterator isam<TKey, TValue>::end() {
+    return isam<TKey, TValue>::iterator(nullptr, iterator::MODE::BEGIN);
 };
 
 #endif // ISAM_ISAM_HPP
