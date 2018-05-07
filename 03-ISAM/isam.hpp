@@ -28,9 +28,17 @@ public:
         return get_single_key_interval(ki);
     }
 
-    iterator begin();
+    iterator begin() {
+        return begin(this, &overflow);
+    }
 
-    iterator end();
+    iterator end() {
+        return end(this, &overflow);
+    }
+
+    iterator begin(isam *isam, std::map<TKey, TValue> *overflow);
+
+    iterator end(isam *isam, std::map<TKey, TValue> *overflow);
 
 private:
     typedef std::pair<TKey, TValue> key_value_pair;
@@ -68,7 +76,7 @@ private:
             return values[current_size - 1].first;
         }
 
-        const size_t get_max_index() const {
+        const size_t get_size() const {
             return current_size;
         }
 
@@ -93,8 +101,8 @@ private:
             else return -1;
         }
 
-        TValue &operator[](size_t index) {
-            return values[index].second;
+        key_value_pair &operator[](size_t index) {
+            return values[index];
         }
 
         void merge_overflow(std::map<TKey, TValue> &overflow) {
@@ -108,13 +116,10 @@ private:
 
             // Merge with overflow
             while (true) {
-                std::cout << "REMOVE: merge" << std::endl;
-
                 // can push more values => emplace values from overflow
                 if (current_size <= max_size && overflow.size() > 0) {
                     block_values.emplace(*overflow.begin());
                     overflow.erase(overflow.begin());
-
                     ++current_size;
                 }
 
@@ -169,7 +174,7 @@ private:
 
     const size_t overflow_size;
 
-    std::map<key_interval, file_block, key_interval_comparator> file_block_map;
+    std::map<key_interval, file_block *, key_interval_comparator> file_block_map;
 
     std::map<TKey, TValue> overflow;
 
@@ -180,24 +185,26 @@ private:
         file_block *previous = nullptr;
 
         while (overflow.size() > 0) {
-            file_block fb;
+            file_block *fb;
 
             if (block_map_iterator != file_block_map.end()) {
                 fb = block_map_iterator->second;
+                previous = fb;
                 file_block_map.erase(block_map_iterator);
             }
             else {
-                fb = file_block(this);
-                if (previous) previous->next = &fb;
-                previous = &fb;
+                fb = new file_block(this);
+                if (previous) previous->next = fb;
+                previous = fb;
             }
 
-            fb.load();
-            fb.merge_overflow(overflow);
-            fb.store();
+            fb->load();
+            fb->merge_overflow(overflow);
+            fb->store();
 
-            auto entry = std::make_pair(key_interval(fb.get_min_key(), fb.get_max_key()), fb);
+            auto entry = std::make_pair(key_interval(fb->get_min_key(), fb->get_max_key()), fb);
             auto insert_result = file_block_map.insert(entry);
+
             block_map_iterator = ++insert_result.first;
         }
     }
@@ -212,45 +219,87 @@ private:
         if (file_block_iterator == file_block_map.end()) return overflow[ki.min_key];
 
         // Load file block
-        file_block *currently_loaded_file_block = &(file_block_iterator->second);
+        file_block *currently_loaded_file_block = file_block_iterator->second;
         currently_loaded_file_block->load();
 
         // Get value
         auto index = currently_loaded_file_block->find(ki.min_key);
         if (index < 0) return overflow[ki.min_key];
-        else return (*currently_loaded_file_block)[index];
+        else return (*currently_loaded_file_block)[index].second;
     }
-
 };
 
 template<typename TKey, typename TValue>
 class isam<TKey, TValue>::iterator {
 public:
-    enum MODE {
-        BEGIN, END
-    };
-
     iterator() = default;
 
-    iterator(isam<TKey, TValue>::file_block *block, MODE mode) : inner_block(block) {}
-
-    iterator &operator++() {
-        iterator it;
-        return it;
+    iterator(isam<TKey, TValue>::file_block *block,
+             std::map<TKey, TValue> *overflow,
+             bool is_end = false) : inner_block(block),
+                                    index(is_end ? block->get_size() : 0),
+                                    overflow(overflow),
+                                    overflow_it(is_end ? overflow->end() : overflow->begin()) {
+        if (block) inner_block->load();
+        if (overflow_it != overflow->end()) overflow_return_value = *overflow_it;
     }
 
-    const iterator operator++(int) {
-        iterator it;
-        return it;
+    ~iterator() {
+        if (inner_block) inner_block->store();
+        if (overflow_it != overflow->end()) overflow_it->second = overflow_return_value.second;
+
     }
 
-    isam<TKey, TValue>::key_value_pair &operator*() {}
+    isam<TKey, TValue>::iterator &operator++() {
+        increment_logic();
+        return *this;
+    }
 
-    isam<TKey, TValue>::key_value_pair *operator->() {}
+    void increment_logic() {
+        // index out of range => only overflow left
+        if (take_from_overflow()) {
+            overflow_it->second = overflow_return_value.second;
+            ++overflow_it;
+        }
+
+            // increase index of the inner file - load & store next might be necessary
+        else if (++index == inner_block->get_size() && inner_block->next) {
+            inner_block->store();
+            inner_block = inner_block->next;
+            inner_block->load();
+            index = 0;
+        }
+    }
+
+    const isam<TKey, TValue>::iterator operator++(int) {
+        auto copy = *this;
+
+        // TODO: !!! DO NOT FORGET !!!
+
+        return copy;
+    }
+
+    isam<TKey, TValue>::key_value_pair &operator*() {
+        if (take_from_overflow()) {
+            overflow_return_value = *overflow_it;
+            return overflow_return_value;
+        }
+        else return (*inner_block)[index];
+    }
+
+    isam<TKey, TValue>::key_value_pair *operator->() {
+        if (take_from_overflow()) {
+            overflow_return_value = *overflow_it;
+            return &overflow_return_value;
+        }
+        else return &(*inner_block)[index];
+    }
 
     bool operator==(const iterator &other) const {
-        return (inner_block->get_block_id() == other.inner_block->get_block_id()
-                && index == other.index);
+        return (inner_block == other.inner_block
+                && index == other.index
+                && overflow_it == other.overflow_it
+        );
     }
 
     bool operator!=(const iterator &other) const {
@@ -259,17 +308,49 @@ public:
 
 private:
     isam<TKey, TValue>::file_block *inner_block;
+    std::map<TKey, TValue> *overflow;
+    typename std::map<TKey, TValue>::iterator overflow_it;
+    isam<TKey, TValue>::key_value_pair overflow_return_value;
     size_t index;
+
+    // Determine if the next value should be taken from the overflow or from inner block
+    bool take_from_overflow() {
+        if (!inner_block) return true;
+        if (overflow_it == overflow->end()) return false;
+
+        if (!inner_block->next && index == inner_block->get_size()) return true;
+        return (overflow_it->first < (*inner_block)[index].first);
+    }
 };
 
 template<typename TKey, typename TValue>
-typename isam<TKey, TValue>::iterator isam<TKey, TValue>::begin() {
-    return isam<TKey, TValue>::iterator(nullptr, iterator::MODE::BEGIN);
+typename isam<TKey, TValue>::iterator isam<TKey, TValue>::begin(
+        isam<TKey, TValue> *isam_ptr,
+        std::map<TKey, TValue> *overflow) {
+
+    // valid file blocks available
+    if (file_block_map.size() > 0) {
+        file_block *fb = isam_ptr->file_block_map.begin()->second;
+        return isam<TKey, TValue>::iterator(fb, overflow, false);
+    }
+
+        // just overflow
+    else return isam<TKey, TValue>::iterator(nullptr, overflow, false);
 };
 
 template<typename TKey, typename TValue>
-typename isam<TKey, TValue>::iterator isam<TKey, TValue>::end() {
-    return isam<TKey, TValue>::iterator(nullptr, iterator::MODE::BEGIN);
+typename isam<TKey, TValue>::iterator isam<TKey, TValue>::end(
+        isam<TKey, TValue> *isam_ptr,
+        std::map<TKey, TValue> *overflow) {
+
+    // valid file blocks available
+    if (file_block_map.size() > 0) {
+        auto before_end = --(isam_ptr->file_block_map.end());
+        file_block *fb = before_end->second;
+        return isam<TKey, TValue>::iterator(fb, overflow, true);
+    }
+        // Just overflow
+    else return isam<TKey, TValue>::iterator(nullptr, overflow, true);
 };
 
 #endif // ISAM_ISAM_HPP
