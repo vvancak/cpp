@@ -5,35 +5,49 @@
 
 #include<map>
 #include<list>
+#include<memory>
 #include"block_provider.hpp"
 
 template<typename TKey, typename TValue>
 class isam {
 private:
-    typedef std::pair<TKey, TValue> key_value_pair;
-
     class file_block {
+    private:
+        typedef std::pair<TKey, TValue> kvp_inner;
+        typedef std::pair<const TKey &, TValue &> kvp_out;
+        typedef std::pair<const TKey &, const TValue &> kvp_out_const;
+
+        size_t block_id = 0;
+        size_t current_size = 0;
+
+        isam *isam_members = 0;
+        kvp_inner *values{};
+
+        std::unique_ptr<kvp_out> last_out;
+        mutable std::unique_ptr<kvp_out_const> last_out_const;
     public:
-        file_block *next = 0;
+        std::unique_ptr<file_block> next = 0;
 
         file_block() = default;
 
         explicit file_block(isam *const parent) :
+                last_out(nullptr),
+                last_out_const(nullptr),
                 current_size(0),
                 isam_members(parent) {
-            block_id = block_provider::create_block(isam_members->block_size * sizeof(key_value_pair));
+            block_id = block_provider::create_block(isam_members->block_size * sizeof(kvp_inner));
         }
 
         void load() {
-            values = static_cast<key_value_pair *>(block_provider::load_block(block_id));
+            values = static_cast<kvp_inner *>(block_provider::load_block(block_id));
         }
 
-        void store() const {
+        void store() {
             auto *block_ptr = static_cast<void *>(values);
             block_provider::store_block(block_id, block_ptr);
         }
 
-        void free() const {
+        void free() {
             block_provider::free_block(block_id);
         }
 
@@ -47,10 +61,6 @@ private:
 
         const size_t get_size() const {
             return current_size;
-        }
-
-        const size_t get_block_id() const {
-            return block_id;
         }
 
         int32_t find(const TKey &key) const {
@@ -70,9 +80,17 @@ private:
             else return -1;
         }
 
-        key_value_pair &operator[](size_t index) {
-            return values[index];
+        std::pair<const TKey &, TValue &> &get_noconst(size_t index) {
+            if (last_out) last_out.release();
+            last_out = std::make_unique<kvp_out>(values[index].first, values[index].second);
+            return *last_out;
         }
+
+        std::pair<const TKey &, const TValue &> get_const(size_t index) const {
+            if (last_out_const) last_out_const.release();
+            last_out_const = std::make_unique<kvp_out_const>(values[index].first, values[index].second);
+            return *last_out_const;
+        };
 
         void merge_overflow(std::map<TKey, TValue> &overflow) {
             const size_t max_size = isam_members->block_size;
@@ -83,27 +101,31 @@ private:
                 block_values.emplace(values[i]);
             }
 
-            // Merge with overflow
+            // Merge
             while (true) {
+                // Nothing to merge
+                if (overflow.size() == 0) break;
+
+                // Full block & correct order
+                if (current_size == max_size && (--block_values.end())->first < overflow.begin()->first) break;
+
                 // can push more values => emplace values from overflow
                 if (current_size <= max_size && overflow.size() > 0) {
                     block_values.emplace(*overflow.begin());
                     overflow.erase(overflow.begin());
+
                     ++current_size;
+                    continue;
                 }
 
                 // too much values => move max to overflow
                 if (current_size > max_size) {
                     overflow.emplace(*(--block_values.end()));
                     block_values.erase(--block_values.end());
+
                     --current_size;
+                    continue;
                 }
-
-                // empty overflow
-                if (overflow.size() == 0) break;
-
-                // order check
-                if ((--block_values.end())->first < overflow.begin()->first) break;
             }
 
             // Store values
@@ -112,12 +134,6 @@ private:
                 values[idx++] = kvp;
             }
         }
-
-    private:
-        isam *isam_members = 0;
-        size_t block_id = 0;
-        size_t current_size = 0;
-        key_value_pair *values{};
     };
 
     struct key_interval {
@@ -141,44 +157,64 @@ private:
 
     const size_t block_size;
 
-    const size_t overflow_size;
+    const size_t max_overflow_size;
+
+    std::unique_ptr<file_block> first_file_block;
+
+    file_block *currently_loaded_file_block;
 
     std::map<key_interval, file_block *, key_interval_comparator> file_block_map;
 
     std::map<TKey, TValue> overflow;
 
     void check_flush_overflow() {
-        if (overflow.size() < overflow_size) return;
+        if (overflow.size() < max_overflow_size) return;
 
+        // Clear currently loaded block
+        if (currently_loaded_file_block) currently_loaded_file_block->store();
+        currently_loaded_file_block = nullptr;
+
+        // First file block
         auto block_map_iterator = file_block_map.begin();
-        file_block *previous = nullptr;
+        file_block *current_file_block = first_file_block.get();
 
+        // Main merge
         while (overflow.size() > 0) {
-            file_block *fb;
 
+            // Take the next file block out of the map
             if (block_map_iterator != file_block_map.end()) {
-                fb = block_map_iterator->second;
-                previous = fb;
+                current_file_block = block_map_iterator->second;
                 file_block_map.erase(block_map_iterator);
             }
-            else {
-                fb = new file_block(this);
-                if (previous) previous->next = fb;
-                previous = fb;
+
+                // Create the next file block -- not the first file block
+            else if (current_file_block) {
+                current_file_block->next = std::make_unique<file_block>(this);
+                current_file_block = current_file_block->next.get();
             }
 
-            fb->load();
-            fb->merge_overflow(overflow);
-            fb->store();
+                // Create the next file block -- first file block
+            else {
+                first_file_block = std::make_unique<file_block>(this);
+                current_file_block = first_file_block.get();
+            }
 
-            auto entry = std::make_pair(key_interval(fb->get_min_key(), fb->get_max_key()), fb);
+            // Load & merge values into the block
+            current_file_block->load();
+            current_file_block->merge_overflow(overflow);
+            current_file_block->store();
+
+            auto entry = std::make_pair(
+                    key_interval(current_file_block->get_min_key(), current_file_block->get_max_key()),
+                    current_file_block
+            );
+
             auto insert_result = file_block_map.insert(entry);
-
             block_map_iterator = ++insert_result.first;
         }
     }
 
-    TValue &get_single_key_interval(const key_interval &ki) {
+    TValue &get_interval_value(const key_interval &ki) {
         check_flush_overflow();
 
         // File Block lookup
@@ -188,22 +224,24 @@ private:
         if (file_block_iterator == file_block_map.end()) return overflow[ki.min_key];
 
         // Load file block
-        file_block *currently_loaded_file_block = file_block_iterator->second;
+        if (currently_loaded_file_block) currently_loaded_file_block->store();
+        currently_loaded_file_block = file_block_iterator->second;
         currently_loaded_file_block->load();
 
-        // Get value
+        // Try get value from the file block
         auto index = currently_loaded_file_block->find(ki.min_key);
         if (index < 0) return overflow[ki.min_key];
-        else return (*currently_loaded_file_block)[index].second;
+        else return currently_loaded_file_block->get_noconst(index).second;
     }
 
 public:
+/*
     class iterator {
     private:
         isam::file_block *inner_block;
         std::map<TKey, TValue> *overflow;
         typename std::map<TKey, TValue>::iterator overflow_it;
-        isam<TKey, TValue>::key_value_pair overflow_return_value;
+        isam<TKey, TValue>::kvp_inner overflow_return_value;
         size_t index;
 
         // Determine if the next value should be taken from the overflow or from inner block
@@ -261,7 +299,7 @@ public:
             }
         }
 
-        isam::key_value_pair &operator*() {
+        isam::kvp_inner &operator*() {
             if (take_from_overflow()) {
                 overflow_return_value = *overflow_it;
                 return overflow_return_value;
@@ -269,7 +307,7 @@ public:
             else return (*inner_block)[index];
         }
 
-        isam::key_value_pair *operator->() {
+        isam::kvp_inner *operator->() {
             if (take_from_overflow()) {
                 overflow_return_value = *overflow_it;
                 return &overflow_return_value;
@@ -288,23 +326,27 @@ public:
             return !operator==(other);
         }
     };
-
-    isam(size_t block_size, size_t overflow_size) :
+*/
+    isam(size_t
+         block_size,
+         size_t overflow_size
+    ) :
+            currently_loaded_file_block(nullptr),
             block_size(block_size),
-            overflow_size(overflow_size),
+            max_overflow_size(overflow_size),
             file_block_map{},
             overflow{} {}
 
     TValue &operator[](const TKey &key) {
         key_interval ki(key);
-        return get_single_key_interval(ki);
+        return get_interval_value(ki);
     }
 
     TValue &operator[](TKey &&key) {
         key_interval ki(key);
-        return get_single_key_interval(ki);
+        return get_interval_value(ki);
     }
-
+/*
     iterator begin() {
         // valid file blocks available
         if (file_block_map.size() > 0) {
@@ -326,6 +368,7 @@ public:
             // Just overflow
         else return iterator(nullptr, &overflow, true);
     }
+*/
 };
 
 #endif // ISAM_ISAM_HPP
