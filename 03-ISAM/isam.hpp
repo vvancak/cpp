@@ -7,131 +7,160 @@
 #include<memory>
 #include"block_provider.hpp"
 
+namespace {
+    template<typename TKey, typename TValue>
+    class block {
+    private:
+        typedef std::pair<TKey, TValue> key_value_pair;
+
+        size_t block_id = 0;
+
+        size_t current_size = 0;
+        size_t max_size = 0;
+
+    public:
+        class handle {
+        private:
+            block *block_ptr = 0;
+            key_value_pair *values = 0;
+
+            void store_values() {
+                auto *values_void_ptr = static_cast<void *>(values);
+                block_provider::store_block(block_ptr->block_id, values_void_ptr);
+            }
+
+        public:
+            handle() = default;
+
+            handle &operator=(const handle &other) {
+                if (this->values) store_values();
+                this->block_ptr = other.block_ptr;
+                this->values = static_cast<key_value_pair *>(block_provider::load_block(block_ptr->block_id));
+                return *this;
+            }
+
+            handle &operator=(handle &&other) {
+                if (this->values) store_values();
+
+                this->block_ptr = other.block_ptr;
+                this->values = other.values;
+                other.values = nullptr;
+
+                return *this;
+            }
+
+            handle(block *block_ptr) : block_ptr(block_ptr) {
+                values = static_cast<key_value_pair *>(block_provider::load_block(block_ptr->block_id));
+            }
+
+            ~handle() {
+                if (values) store_values();
+            }
+
+            const TKey &min_key() const {
+                return values[0].first;
+            }
+
+            const TKey &max_key() const {
+                return values[block_ptr->current_size - 1].first;
+            }
+
+            int32_t find(const TKey &key) const {
+                int32_t upper = block_ptr->current_size - 1;
+                int32_t lower = 0;
+
+                while (upper > lower) {
+                    int32_t index = (upper + lower) / 2;
+                    TKey current_key = values[index].first;
+
+                    if (key < current_key) upper = index - 1;
+                    else if (current_key < key) lower = index + 1;
+                    else return index;
+                }
+
+                if (!(values[lower].first < key) && !(key < values[lower].first)) return lower;
+                else return -1;
+            }
+
+            key_value_pair &operator[](size_t index) {
+                return values[index];
+            }
+
+            block *split_block() {
+                auto new_block = std::make_unique<block>(block_ptr->max_size);
+                auto *new_block_ptr = new_block.get();
+                handle new_block_handle = new_block->load();
+
+                new_block->next = std::move(block_ptr->next);
+                block_ptr->next = std::move(new_block);
+
+                size_t count = block_ptr->current_size / 2;
+                size_t init_index = (block_ptr->current_size) - count;
+                for (size_t idx = 0; idx < count; ++idx) {
+                    new_block_handle.values[idx] = values[init_index + count];
+                }
+
+                block_ptr->current_size -= count;
+                new_block_ptr->current_size = count;
+
+                return new_block_ptr;
+            }
+
+            void merge_overflow(std::map<TKey, TValue> &overflow, const TKey *upper_bound) {
+                size_t index = 0;
+                while (!block_ptr->is_full() && overflow.size() > 0) {
+                    // overflow beyond upper bound
+                    if (upper_bound && overflow.begin()->first > *upper_bound) return;
+
+                        // just overflow
+                    else if (index == block_ptr->current_size) {
+                        block_ptr->current_size += 1;
+
+                        auto it = overflow.begin();
+                        values[index] = std::move(*it);
+                        overflow.erase(it);
+                    }
+
+                        // overflow and values
+                    else if (overflow.begin()->first < values[index].first) {
+                        overflow.insert(values[index]);
+                        auto it = overflow.begin();
+                        values[index] = std::move(*it);
+                        overflow.erase(it);
+                    }
+
+                    else break;
+
+                    ++index;
+                }
+            }
+        };
+
+        std::unique_ptr<block> next = 0;
+
+        explicit block(size_t max_size) : current_size(0),
+                                          max_size(max_size) {
+            block_id = block_provider::create_block(max_size * sizeof(key_value_pair));
+        }
+
+        ~block() {
+            block_provider::free_block(block_id);
+        }
+
+        const bool is_full() const { return current_size == max_size; }
+
+        const size_t get_size() const { return current_size; }
+
+        handle load() { return handle(this); }
+    };
+}
+
 template<typename TKey, typename TValue>
 class isam {
 private:
-    class file_block {
-    private:
-        typedef std::pair<TKey, TValue> kvp_inner;
-        typedef std::pair<const TKey &, TValue &> kvp_out;
-        typedef std::pair<const TKey &, const TValue &> kvp_out_const;
-
-        size_t block_id = 0;
-        size_t current_size = 0;
-
-        isam *isam_members = 0;
-        kvp_inner *values = 0;
-
-        std::unique_ptr<kvp_out> last_out;
-        mutable std::unique_ptr<kvp_out_const> last_out_const;
-    public:
-        std::unique_ptr<file_block> next = 0;
-
-        file_block() = default;
-
-        ~file_block() {
-            if (values) block_provider::free_block(block_id);
-        }
-
-        explicit file_block(isam *const parent) :
-                last_out(nullptr),
-                last_out_const(nullptr),
-                current_size(0),
-                isam_members(parent) {
-            block_id = block_provider::create_block(isam_members->block_size * sizeof(kvp_inner));
-        }
-
-        void load() {
-            values = static_cast<kvp_inner *>(block_provider::load_block(block_id));
-        }
-
-        void store() {
-            auto *block_ptr = static_cast<void *>(values);
-            block_provider::store_block(block_id, block_ptr);
-        }
-
-        const TKey &get_min_key() const {
-            return values[0].first;
-        }
-
-        const TKey &get_max_key() const {
-            return values[current_size - 1].first;
-        }
-
-        const size_t get_size() const {
-            return current_size;
-        }
-
-        int32_t find(const TKey &key) const {
-            int32_t upper = current_size - 1;
-            int32_t lower = 0;
-
-            while (upper > lower) {
-                int32_t index = (upper + lower) / 2;
-                TKey current_key = values[index].first;
-
-                if (key < current_key) upper = index - 1;
-                else if (current_key < key) lower = index + 1;
-                else return index;
-            }
-
-            if (!(values[lower].first < key) && !(key < values[lower].first)) return lower;
-            else return -1;
-        }
-
-        kvp_out &get(size_t index) {
-            last_out = std::make_unique<kvp_out>(values[index].first, values[index].second);
-            return *last_out;
-        }
-
-        kvp_out_const &get_const(size_t index) const {
-            last_out_const = std::make_unique<kvp_out_const>(values[index].first, values[index].second);
-            return *last_out_const;
-        };
-
-        void merge_overflow(std::map<TKey, TValue> &overflow) {
-            const size_t max_size = isam_members->block_size;
-
-            // Create a file_block_map with current values
-            std::map<TKey, TValue> block_values;
-            for (size_t i = 0; i < current_size; ++i) {
-                block_values.emplace(values[i]);
-            }
-
-            // Merge
-            while (true) {
-                // Nothing to merge
-                if (current_size <= max_size && overflow.size() == 0) break;
-
-                // Full block & correct order
-                if (current_size == max_size && (--block_values.end())->first < overflow.begin()->first) break;
-
-                // can push more values => emplace values from overflow
-                if (current_size <= max_size && overflow.size() > 0) {
-                    block_values.emplace(*overflow.begin());
-                    overflow.erase(overflow.begin());
-
-                    ++current_size;
-                    continue;
-                }
-
-                // too much values => move max to overflow
-                if (current_size > max_size) {
-                    overflow.emplace(*(--block_values.end()));
-                    block_values.erase(--block_values.end());
-
-                    --current_size;
-                    continue;
-                }
-            }
-
-            // Store values
-            size_t idx = 0;
-            for (auto &&kvp : block_values) {
-                values[idx++] = kvp;
-            }
-        }
-    };
+    typedef std::pair<TKey, TValue> key_value_pair;
+    typedef block<TKey, TValue> file_block;
+    typedef typename file_block::handle file_block_handle;
 
     struct key_interval {
         key_interval() = default;
@@ -160,59 +189,60 @@ private:
 
     std::unique_ptr<file_block> first_file_block;
 
-    mutable file_block *currently_loaded_file_block;
+    mutable file_block *loaded_block;
+
+    mutable file_block_handle loaded_block_handle;
 
     std::map<key_interval, file_block *, key_interval_comparator> file_block_map;
 
     std::map<TKey, TValue> overflow;
 
-    void check_flush_currently_loaded_fb() {
-        if (currently_loaded_file_block) currently_loaded_file_block->store();
-        currently_loaded_file_block = nullptr;
-    }
-
     void check_flush_overflow() {
         if (overflow.size() < max_overflow_size) return;
 
-        check_flush_currently_loaded_fb();
+        // Clear all loaded blocks from operator[]
+        loaded_block = nullptr;
+        loaded_block_handle = std::move(file_block_handle());
 
-        // First file block
+        // Iterators
         auto block_map_iterator = file_block_map.begin();
-        file_block *current_file_block = first_file_block.get();
+        file_block *current_file_block = nullptr;
 
-        // Main merge
+        // Merge
         while (overflow.size() > 0) {
 
-            // Take the next file block out of the map
-            if (block_map_iterator != file_block_map.end()) {
+            // No first block
+            if (!first_file_block) {
+                first_file_block = std::make_unique<file_block>(block_size);
+                current_file_block = first_file_block.get();
+            }
+
+                // No next block
+            else if (block_map_iterator == file_block_map.end()) {
+                current_file_block->next = std::make_unique<file_block>(block_size);
+                current_file_block = current_file_block->next.get();
+            }
+
+                // Default - Take out of map
+            else {
                 current_file_block = block_map_iterator->second;
                 file_block_map.erase(block_map_iterator);
             }
 
-                // Create the next file block -- not the first file block
-            else if (current_file_block) {
-                current_file_block->next = std::make_unique<file_block>(this);
-                current_file_block = current_file_block->next.get();
-            }
-
-                // Create the next file block -- first file block
-            else {
-                first_file_block = std::make_unique<file_block>(this);
-                current_file_block = first_file_block.get();
-            }
-
             // Load & merge values into the block
-            current_file_block->load();
-            current_file_block->merge_overflow(overflow);
-            current_file_block->store();
-
-            auto entry = std::make_pair(
-                    key_interval(current_file_block->get_min_key(), current_file_block->get_max_key()),
-                    current_file_block
-            );
+            auto block_handle = current_file_block->load();
+            const TKey *upper_bound = nullptr;
+            if (++block_map_iterator != file_block_map.end())upper_bound = &(block_map_iterator->first.min_key);
+            block_handle.merge_overflow(overflow, upper_bound);
 
             // Insert file block back into the file map
+            auto entry = std::make_pair(
+                    key_interval(block_handle.min_key(), block_handle.max_key()),
+                    current_file_block
+            );
             auto insert_result = file_block_map.insert(entry);
+
+            // Move iterator to the next block
             block_map_iterator = ++insert_result.first;
         }
     }
@@ -221,135 +251,111 @@ private:
         check_flush_overflow();
 
         // File Block lookup
-        auto file_block_iterator = file_block_map.find(ki);
+        auto file_block_it = file_block_map.find(ki);
 
         // No entry => Overflow
-        if (file_block_iterator == file_block_map.end()) return overflow[ki.min_key];
+        if (file_block_it == file_block_map.end()) return overflow[ki.min_key];
 
         // Load file block
-        if (currently_loaded_file_block != file_block_iterator->second) {
-            if (currently_loaded_file_block) currently_loaded_file_block->store();
-            currently_loaded_file_block = file_block_iterator->second;
-            currently_loaded_file_block->load();
+        if (loaded_block != file_block_it->second) {
+            loaded_block = file_block_it->second;
+            loaded_block_handle = loaded_block->load();
         }
 
-        // Try get value from the file block
-        auto index = currently_loaded_file_block->find(ki.min_key);
+        // Try get value from the file block (else overflow)
+        auto index = loaded_block_handle.find(ki.min_key);
+
         if (index < 0) return overflow[ki.min_key];
-        else return currently_loaded_file_block->get(index).second;
+        else return loaded_block_handle[index].second;
     }
 
     const TValue &get_interval_value(const key_interval &ki) const {
 
         // File Block lookup
-        auto file_block_iterator = file_block_map.find(ki);
+        auto file_block_it = file_block_map.find(ki);
 
         // No entry => Overflow
-        if (file_block_iterator == file_block_map.end()) {
-            auto pos = overflow.find(ki.min_key);
-            if (pos != overflow.end()) return pos->second;
-            else return default_tvalue;
-        }
+        if (file_block_it == file_block_map.end()) return overflow[ki.min_key];
 
         // Load file block
-        if (currently_loaded_file_block != file_block_iterator->second) {
-            if (currently_loaded_file_block) currently_loaded_file_block->store();
-            currently_loaded_file_block = file_block_iterator->second;
-            currently_loaded_file_block->load();
+        if (loaded_block != file_block_it->second) {
+            loaded_block = file_block_it->second;
+            loaded_block_handle = loaded_block->load();
         }
 
-        // Try get value from the file block
-        auto index = currently_loaded_file_block->find(ki.min_key);
-        if (index < 0) {
-            auto pos = overflow.find(ki.min_key);
-            if (pos != overflow.end()) return pos->second;
-            else return default_tvalue;
-        }
-        else return currently_loaded_file_block->get_const(index).second;
+        // Try get value from the file block (else overflow)
+        auto index = loaded_block_handle.find(ki.min_key);
+
+        if (index < 0) return overflow[ki.min_key];
+        else return loaded_block_handle[index].second;
     }
 
 public:
     class iterator {
     private:
-        typedef std::pair<const TKey &, TValue &> kvp_out;
         typedef typename std::map<TKey, TValue>::iterator overflow_iterator;
-
-        // file blocks
-        isam::file_block *inner_block;
-        size_t index;
 
         // overflow
         overflow_iterator overflow_it;
         overflow_iterator overflow_end;
-        std::unique_ptr<kvp_out> overflow_return_value;
+
+        // file blocks
+        file_block *loaded_block;
+        file_block_handle loaded_block_handle;
+        size_t index;
+
 
         // Determine if the next value should be taken from the overflow or from inner block
         bool take_from_overflow() {
-            if (!inner_block) return true;
+            if (!loaded_block) return true;
             if (overflow_it == overflow_end) return false;
 
             // both have values => check if overflow has lower value
-            return (overflow_it->first < inner_block->get(index).first);
+            return (overflow_it->first < loaded_block_handle[index].first);
         }
 
     public:
-        typedef kvp_out value_type;
-        typedef kvp_out &reference;
-        typedef kvp_out *pointer;
+        typedef std::pair<const TKey, TValue> value_type;
+        typedef value_type &reference;
+        typedef value_type *pointer;
         typedef std::forward_iterator_tag iterator_category;
         typedef int32_t difference_type;
 
         iterator() = default;
 
         iterator(const iterator &other) : index(other.index),
-                                          inner_block(other.inner_block),
+                                          loaded_block(other.loaded_block),
+                                          loaded_block_handle(other.loaded_block_handle),
                                           overflow_it(other.overflow_it),
-                                          overflow_end(other.overflow_end) {
-            if (inner_block) inner_block->load();
-            if (overflow_it != overflow_end)
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-        }
+                                          overflow_end(other.overflow_end) {}
 
         iterator &operator=(const iterator &other) {
-            if (inner_block) inner_block->store();
-
             index = other.index;
-            inner_block = other.inner_block;
+            loaded_block = other.loaded_block;
+            loaded_block_handle = other.loaded_block_handle;
+
             overflow_it = other.overflow_it;
             overflow_end = other.overflow_end;
 
-            if (inner_block) inner_block->load();
-            if (overflow_it != overflow_end)
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
             return *this;
         }
 
         // Begin-Constructor
         iterator(overflow_iterator &&overflow_it,
                  overflow_iterator &&overflow_end,
-                 file_block *file_block
-        ) : index(0),
-            inner_block(file_block),
-            overflow_it(overflow_it),
+                 file_block *loaded_block
+        ) : overflow_it(overflow_it),
             overflow_end(overflow_end),
-            overflow_return_value(nullptr) {
-
-            if (inner_block) inner_block->load();
-            if (overflow_it != overflow_end)
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-        }
+            index(0),
+            loaded_block(loaded_block),
+            loaded_block_handle(loaded_block->load()) {}
 
         // End-Constructor
-        explicit iterator(overflow_iterator &&overflow_end) : index(0),
-                                                              inner_block(0),
-                                                              overflow_it(overflow_end),
+        explicit iterator(overflow_iterator &&overflow_end) : overflow_it(overflow_end),
                                                               overflow_end(overflow_it),
-                                                              overflow_return_value(nullptr) {}
-
-        ~iterator() {
-            if (inner_block) inner_block->store();
-            inner_block = nullptr;
-        }
+                                                              index(0),
+                                                              loaded_block(0),
+                                                              loaded_block_handle() {}
 
         iterator &operator++() {
             increment_logic();
@@ -364,37 +370,33 @@ public:
 
         void increment_logic() {
             // overflow
-            if (take_from_overflow()) {
-                if (++overflow_it == overflow_end) return;
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-            }
+            if (take_from_overflow()) ++overflow_it;
 
                 // file
-            else if (++index == inner_block->get_size()) {
-                inner_block->store();
-                inner_block = inner_block->next.get();
+            else if (++index == loaded_block->get_size()) {
                 index = 0;
+                loaded_block = loaded_block->next.get();
 
-                if (inner_block) inner_block->load();
+                if (loaded_block) loaded_block_handle = loaded_block->load();
             }
         }
 
-        std::pair<const TKey &, TValue &> &operator*() {
+        reference operator*() {
             if (take_from_overflow()) {
-                return *overflow_return_value;
+                return *overflow_it;
             }
-            else return inner_block->get(index);
+            else return (reference) loaded_block_handle[index];
         }
 
-        std::pair<const TKey &, TValue &> *operator->() {
+        pointer operator->() {
             if (take_from_overflow()) {
-                return overflow_return_value.get();
+                return &(*overflow_it);
             }
-            else return &(inner_block->get(index));
+            else return (pointer) &loaded_block_handle[index];
         }
 
         bool operator==(const iterator &other) const {
-            return (inner_block == other.inner_block
+            return (loaded_block == other.loaded_block
                     && index == other.index
                     && overflow_it == other.overflow_it
             );
@@ -405,154 +407,16 @@ public:
         }
     };
 
-    class const_iterator {
-    private:
-        typedef std::pair<const TKey &, const TValue &> kvp_out;
-        typedef typename std::map<TKey, TValue>::const_iterator overflow_iterator;
-
-        // file blocks
-        isam::file_block *inner_block;
-        size_t index;
-
-        // overflow
-        overflow_iterator overflow_it;
-        overflow_iterator overflow_end;
-        std::unique_ptr<kvp_out> overflow_return_value;
-
-        // Determine if the next value should be taken from the overflow or from inner block
-        bool take_from_overflow() const {
-            if (!inner_block) return true;
-            if (overflow_it == overflow_end) return false;
-
-            // both have values => check if overflow has lower value
-            return (overflow_it->first < inner_block->get(index).first);
-        }
-
-    public:
-        typedef kvp_out value_type;
-        typedef kvp_out &reference;
-        typedef kvp_out *pointer;
-        typedef std::forward_iterator_tag iterator_category;
-        typedef int32_t difference_type;
-
-        const_iterator() = default;
-
-        const_iterator(const const_iterator &other) : index(other.index),
-                                                      inner_block(other.inner_block),
-                                                      overflow_it(other.overflow_it),
-                                                      overflow_end(other.overflow_end) {
-            if (inner_block) inner_block->load();
-            if (overflow_it != overflow_end)
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-        }
-
-        const_iterator &operator=(const const_iterator &other) {
-            if (inner_block) inner_block->store();
-
-            index = other.index;
-            inner_block = other.inner_block;
-            overflow_it = other.overflow_it;
-            overflow_end = other.overflow_end;
-
-            if (inner_block) inner_block->load();
-            if (overflow_it != overflow_end)
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-            return *this;
-        }
-
-        // Begin-Constructor
-        const_iterator(overflow_iterator &&overflow_it,
-                       overflow_iterator &&overflow_end,
-                       file_block *file_block
-        ) : index(0),
-            inner_block(file_block),
-            overflow_it(overflow_it),
-            overflow_end(overflow_end),
-            overflow_return_value(nullptr) {
-
-            if (inner_block) inner_block->load();
-            if (overflow_it != overflow_end)
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-        }
-
-        // End-Constructor
-        explicit const_iterator(overflow_iterator &&overflow_end) : index(0),
-                                                                    inner_block(0),
-                                                                    overflow_it(overflow_end),
-                                                                    overflow_end(overflow_it),
-                                                                    overflow_return_value(nullptr) {}
-
-        ~const_iterator() {
-            if (inner_block) inner_block->store();
-        }
-
-        const_iterator &operator++() {
-            increment_logic();
-            return *this;
-        }
-
-        const const_iterator operator++(int) {
-            auto copy = *this;
-            increment_logic();
-            return copy;
-        }
-
-        void increment_logic() {
-            // overflow
-            if (take_from_overflow()) {
-                if (++overflow_it == overflow_end) return;
-
-                overflow_return_value = std::make_unique<kvp_out>(overflow_it->first, overflow_it->second);
-            }
-
-                // file
-            else if (++index == inner_block->get_size()) {
-                inner_block->store();
-                inner_block = inner_block->next.get();
-                index = 0;
-
-                if (inner_block) inner_block->load();
-            }
-        }
-
-        kvp_out &operator*() const {
-            if (take_from_overflow()) {
-                return *overflow_return_value;
-            }
-            else return inner_block->get_const(index);
-        }
-
-        kvp_out *operator->() const {
-            if (take_from_overflow()) {
-                return overflow_return_value.get();
-            }
-            else return &(inner_block->get(index));
-        }
-
-        bool operator==(const const_iterator &other) const {
-            return (inner_block == other.inner_block
-                    && index == other.index
-                    && overflow_it == other.overflow_it
-            );
-        }
-
-        bool operator!=(const const_iterator &other) const {
-            return !(operator==(other));
-        }
-    };
-
     isam(size_t block_size, size_t overflow_size) : block_size(block_size),
                                                     max_overflow_size(overflow_size),
+
+                                                    default_tvalue(),
 
                                                     overflow{},
                                                     file_block_map{},
 
-                                                    default_tvalue(),
-                                                    currently_loaded_file_block(nullptr) {}
-
-    ~isam() {
-        check_flush_currently_loaded_fb();
-    }
+                                                    loaded_block(),
+                                                    loaded_block_handle() {}
 
     TValue &operator[](const TKey &key) {
         key_interval ki(key);
@@ -579,18 +443,18 @@ public:
         return iterator(overflow.begin(), overflow.end(), fb_ptr);
     }
 
-    const_iterator begin() const {
-        file_block *fb_ptr = first_file_block ? first_file_block.get() : nullptr;
+    /*const_iterator begin() const {
+        block *fb_ptr = first_file_block ? first_file_block.get() : nullptr;
         return const_iterator(overflow.begin(), overflow.end(), fb_ptr);
-    }
+    }*/
 
     iterator end() {
         return iterator(overflow.end());
     }
 
-    const_iterator end() const {
+    /*const_iterator end() const {
         return const_iterator(overflow.end());
-    }
+    }*/
 };
 
 #endif // ISAM_ISAM_HPP
