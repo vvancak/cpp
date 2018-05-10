@@ -279,7 +279,10 @@ private:
 
             // Load & merge values into the block
             loaded_block_handle = loaded_block->load();
-            loaded_block_handle.merge_overflow(overflow, next_block_min_key);
+            auto first_overflow_key = overflow.begin()->first;
+            if (loaded_block->get_size() == 0 || first_overflow_key < loaded_block_handle.max_key()) {
+                loaded_block_handle.merge_overflow(overflow, next_block_min_key);
+            }
 
             auto entry = std::make_pair(
                     key_interval(loaded_block_handle.min_key(), loaded_block_handle.max_key()),
