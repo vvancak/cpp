@@ -44,7 +44,7 @@ namespace {
             }
 
             bool consider_upperbound(const TKey *upper_bound) {
-                if (block_ptr->max_size < 2) return false;
+                if (block_ptr->max_size < FILL_FACTOR_DELIMITER) return false;
                 return (upper_bound != nullptr);
             }
 
@@ -109,6 +109,7 @@ namespace {
             block *get_block_ptr() const { return block_ptr; }
 
             handle split_block() {
+
                 // Create new block
                 auto new_block = std::make_unique<block>(block_ptr->max_size);
                 auto *new_block_ptr = new_block.get();
@@ -125,6 +126,7 @@ namespace {
                     new_block_handle.values[idx] = values[init_index + idx];
                 }
 
+                // Modify sizes
                 block_ptr->current_size -= count;
                 new_block_ptr->current_size = count;
 
@@ -180,11 +182,6 @@ namespace {
 
         const size_t get_size() const { return current_size; }
 
-        bool needs_split() {
-            if (max_size < FILL_FACTOR_DELIMITER) return false;
-            return current_size >= (FILL_FACTOR_SPLIT * max_size);
-        }
-
         handle load() { return handle(this); }
     };
 }
@@ -197,7 +194,7 @@ private:
     typedef typename file_block::handle file_block_handle;
 
     struct key_interval {
-        key_interval() = delete;
+        key_interval() = default;
 
         explicit key_interval(TKey &&key) : min_key(key), max_key(min_key) {}
 
@@ -231,64 +228,101 @@ private:
 
     std::map<TKey, TValue> overflow;
 
-    void check_split_block(file_block *block) {
-        if (!block->needs_split()) return;
+    void check_split_block() {
+        if (!loaded_block) return;
+        if (block_size < FILL_FACTOR_DELIMITER) return;
+        if (loaded_block->get_size() < FILL_FACTOR_SPLIT * block_size) return;
 
-        auto new_block_handle = block->load().split_block();
+        auto &overflow_smallest_key = overflow.begin()->first;
+        loaded_block_handle = loaded_block->load();
+        if (loaded_block_handle.max_key() < overflow_smallest_key) return;
+
+        // Split the block
+        std::cout << "SPLIT" << std::endl;
+        auto new_block_handle = loaded_block_handle.split_block();
+
+        // Insert block into the file map
         auto entry = std::make_pair(
                 key_interval(new_block_handle.min_key(), new_block_handle.max_key()),
                 new_block_handle.get_block_ptr()
         );
         file_block_map.insert(entry);
+
+        // loaded_block stays where it was
+    }
+
+    void check_append_next() {
+        if (!loaded_block) return;
+        if (loaded_block->get_size() <= block_size) return;
+        if (loaded_block->next) return;
+
+        auto &overflow_smallest_key = overflow.begin()->first;
+        loaded_block_handle = loaded_block->load();
+        if (loaded_block_handle.max_key() < overflow_smallest_key) return;
+
+        // Append next
+        loaded_block->next = std::make_unique<file_block>(block_size);
+
+        // Insert block back into the file map
+        loaded_block_handle = loaded_block->load();
+        auto entry = std::make_pair(
+                key_interval(loaded_block_handle.min_key(), loaded_block_handle.max_key()),
+                loaded_block
+        );
+        file_block_map.insert(entry);
+
+        // Set next loaded block
+        loaded_block = loaded_block->next.get();
     }
 
     void check_flush_overflow() {
         if (overflow.size() < max_overflow_size) return;
 
         loaded_block = nullptr;
-        auto block_map_iterator = file_block_map.begin();
-        const TKey *next_block_min_key = nullptr;
 
+        // Make sure first file block exists
+        if (!first_file_block) {
+            first_file_block = std::make_unique<file_block>(block_size);
+            auto entry = std::make_pair(key_interval(), first_file_block.get());
+            file_block_map.insert(entry);
+        }
+
+        // Merging
         while (overflow.size() > 0) {
-            next_block_min_key = nullptr;
+            std::cout << "MERGE" << std::endl;
 
-            // Take the next file block out of the map
-            if (block_map_iterator != file_block_map.end()) {
-                loaded_block = block_map_iterator->second;
-                file_block_map.erase(block_map_iterator);
+            check_split_block();
+            check_append_next();
 
-                // Next Block - upper boundary for keys in this block + splitting
-                auto copy = block_map_iterator;
-                if (++copy != file_block_map.end()) {
-                    next_block_min_key = &(copy->first.min_key);
-                    check_split_block(loaded_block);
-                }
-            }
+            // Find file block in the map
+            auto &overflow_smallest_key = overflow.begin()->first;
+            auto ki = key_interval(overflow_smallest_key, overflow_smallest_key);
 
-                // Create the next file block -- not the first file block
-            else if (loaded_block) {
-                loaded_block->next = std::make_unique<file_block>(block_size);
-                loaded_block = loaded_block->next.get();
-            }
+            auto block_map_iterator = file_block_map.find(ki);
+            if (block_map_iterator != file_block_map.begin()) --block_map_iterator;
+            loaded_block = block_map_iterator->second;
 
-                // Create the next file block -- first file block
-            else {
-                first_file_block = std::make_unique<file_block>(block_size);
-                loaded_block = first_file_block.get();
-            }
+            // Find the next block min key
+            auto copy = block_map_iterator;
+            const TKey *next_block_min_key = nullptr;
+            if (++copy != file_block_map.end()) next_block_min_key = &(copy->first.min_key);
+
+            // Erase from map (if was in map)
+            if (block_map_iterator != file_block_map.end()) file_block_map.erase(block_map_iterator);
 
             // Load & merge values into the block
             loaded_block_handle = loaded_block->load();
+            if (loaded_block->get_size() > 0 && loaded_block_handle.max_key() < overflow_smallest_key) continue;
+
+            // Merge
             loaded_block_handle.merge_overflow(overflow, next_block_min_key);
 
+            // Insert into the map
             auto entry = std::make_pair(
                     key_interval(loaded_block_handle.min_key(), loaded_block_handle.max_key()),
                     loaded_block
             );
-
-            // Insert file block back into the file map
-            auto insert_result = file_block_map.insert(entry);
-            block_map_iterator = ++insert_result.first;
+            file_block_map.insert(entry);
         }
     }
 
@@ -360,7 +394,7 @@ public:
 
 
         // Determine if the next value should be taken from the overflow or from inner block
-        bool take_from_overflow() {
+        bool take_from_overflow() const {
             if (!loaded_block) return true;
             if (overflow_it == overflow_end) return false;
 
@@ -393,9 +427,10 @@ public:
         // Copy
         iterator(const iterator &other) : index(other.index),
                                           loaded_block(other.loaded_block),
-                                          loaded_block_handle(loaded_block->load()),
                                           overflow_it(other.overflow_it),
-                                          overflow_end(other.overflow_end) {}
+                                          overflow_end(other.overflow_end) {
+            if (loaded_block) loaded_block_handle = loaded_block->load();
+        }
 
         // Copy-Assignment
         iterator &operator=(const iterator &other) {
@@ -510,9 +545,10 @@ public:
         // Copy
         const_iterator(const const_iterator &other) : index(other.index),
                                                       loaded_block(other.loaded_block),
-                                                      loaded_block_handle(loaded_block->load()),
                                                       overflow_it(other.overflow_it),
-                                                      overflow_end(other.overflow_end) {}
+                                                      overflow_end(other.overflow_end) {
+            if (loaded_block) loaded_block_handle = loaded_block->load();
+        }
 
         // Copy-Assign
         const_iterator &operator=(const const_iterator &other) {
@@ -527,7 +563,8 @@ public:
         }
 
         // Begin-Constructor
-        const_iterator(overflow_iterator &&overflow_it, overflow_iterator &&overflow_end, file_block *loaded_block) :
+        const_iterator(overflow_iterator &&overflow_it, overflow_iterator &&overflow_end, file_block *loaded_block)
+                :
                 overflow_it(overflow_it),
                 overflow_end(overflow_end),
                 index(0),
