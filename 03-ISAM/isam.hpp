@@ -58,7 +58,7 @@ namespace {
             }
 
             handle &operator=(handle &&other) {
-                if (this->values && this->values != other.values) store();
+                if (this->values) store();
 
                 this->block_ptr = other.block_ptr;
                 this->values = other.values;
@@ -134,6 +134,13 @@ namespace {
             }
 
             void merge_overflow(std::map<TKey, TValue> &overflow, const TKey *upper_bound) {
+
+                // Block full and values in overflow too large
+                if (block_ptr->get_size() == block_ptr->max_size && max_key() < overflow.begin()->first) {
+                    return;
+                }
+
+                // Merge
                 size_t index = 0;
                 while (true) {
                     // block is full
@@ -230,15 +237,15 @@ private:
 
     void check_split_block() {
         if (!loaded_block) return;
+        if (!loaded_block->next) return;
         if (block_size < FILL_FACTOR_DELIMITER) return;
         if (loaded_block->get_size() < FILL_FACTOR_SPLIT * block_size) return;
 
         auto &overflow_smallest_key = overflow.begin()->first;
-        loaded_block_handle = loaded_block->load();
+        auto loaded_block_handle = loaded_block->load();
         if (loaded_block_handle.max_key() < overflow_smallest_key) return;
 
         // Split the block
-        std::cout << "SPLIT" << std::endl;
         auto new_block_handle = loaded_block_handle.split_block();
 
         // Insert block into the file map
@@ -247,18 +254,17 @@ private:
                 new_block_handle.get_block_ptr()
         );
         file_block_map.insert(entry);
-
         // loaded_block stays where it was
     }
 
     void check_append_next() {
         if (!loaded_block) return;
-        if (loaded_block->get_size() <= block_size) return;
+        if (loaded_block->get_size() < block_size) return;
         if (loaded_block->next) return;
 
         auto &overflow_smallest_key = overflow.begin()->first;
         loaded_block_handle = loaded_block->load();
-        if (loaded_block_handle.max_key() < overflow_smallest_key) return;
+        if (overflow_smallest_key < loaded_block_handle.max_key()) return;
 
         // Append next
         loaded_block->next = std::make_unique<file_block>(block_size);
@@ -278,8 +284,6 @@ private:
     void check_flush_overflow() {
         if (overflow.size() < max_overflow_size) return;
 
-        loaded_block = nullptr;
-
         // Make sure first file block exists
         if (!first_file_block) {
             first_file_block = std::make_unique<file_block>(block_size);
@@ -287,20 +291,24 @@ private:
             file_block_map.insert(entry);
         }
 
+        loaded_block = first_file_block.get();
+
         // Merging
         while (overflow.size() > 0) {
-            std::cout << "MERGE" << std::endl;
-
-            check_split_block();
-            check_append_next();
-
             // Find file block in the map
             auto &overflow_smallest_key = overflow.begin()->first;
             auto ki = key_interval(overflow_smallest_key, overflow_smallest_key);
 
-            auto block_map_iterator = file_block_map.find(ki);
-            if (block_map_iterator != file_block_map.begin()) --block_map_iterator;
-            loaded_block = block_map_iterator->second;
+            auto block_map_iterator = file_block_map.lower_bound(ki);
+
+            // No lower bound => last block
+            if (block_map_iterator == file_block_map.end()) --block_map_iterator;
+
+                // Check previous block (even though smaller, still does not have to be full)
+            else if (block_map_iterator != file_block_map.begin()) {
+                auto previous = block_map_iterator;
+                if ((--previous)->second->get_size() < block_size) --block_map_iterator;
+            }
 
             // Find the next block min key
             auto copy = block_map_iterator;
@@ -310,11 +318,13 @@ private:
             // Erase from map (if was in map)
             if (block_map_iterator != file_block_map.end()) file_block_map.erase(block_map_iterator);
 
+            loaded_block = block_map_iterator->second;
+
+            check_split_block();
+            check_append_next();
+
             // Load & merge values into the block
             loaded_block_handle = loaded_block->load();
-            if (loaded_block->get_size() > 0 && loaded_block_handle.max_key() < overflow_smallest_key) continue;
-
-            // Merge
             loaded_block_handle.merge_overflow(overflow, next_block_min_key);
 
             // Insert into the map
