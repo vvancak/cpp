@@ -86,6 +86,9 @@ namespace {
             }
 
             int32_t find(const TKey &key) const {
+                if (max_key() < key) return -1;
+                if (key < min_key()) return -1;
+
                 int32_t upper = block_ptr->current_size - 1;
                 int32_t lower = 0;
 
@@ -109,6 +112,7 @@ namespace {
             block *get_block_ptr() const { return block_ptr; }
 
             handle split_block() {
+
                 // Create new block
                 auto new_block = std::make_unique<block>(block_ptr->max_size);
                 auto *new_block_ptr = new_block.get();
@@ -154,8 +158,11 @@ namespace {
                         overflow.erase(it);
                     }
 
-                        // just overflow; but beyond upper bound
-                    else if (consider_upperbound(upper_bound) && *upper_bound < overflow.begin()->first) break;
+                        // just overflow : beyond upper bound
+                    else if (consider_upperbound(upper_bound)
+                             && *upper_bound < overflow.begin()->first) {
+                        break;
+                    }
 
                         // just overflow => pure insert
                     else if (index == block_ptr->current_size) {
@@ -165,8 +172,6 @@ namespace {
                         values[index] = *it;
                         overflow.erase(it);
                     }
-                    else throw std::logic_error("should not get here");
-
                     ++index;
                 }
             }
@@ -177,6 +182,8 @@ namespace {
         explicit block(size_t max_size) : current_size(0), max_size(max_size) { create(); }
 
         ~block() { free(); }
+
+        const bool is_full() const { return current_size == max_size; }
 
         const size_t get_size() const { return current_size; }
 
@@ -196,25 +203,6 @@ private:
     typedef block<TKey, TValue> file_block;
     typedef typename file_block::handle file_block_handle;
 
-    struct key_interval {
-        key_interval() = delete;
-
-        explicit key_interval(TKey &&key) : min_key(key), max_key(min_key) {}
-
-        explicit key_interval(const TKey &key) : min_key(key), max_key(key) {}
-
-        key_interval(const TKey &min, const TKey &max) : min_key(min), max_key(max) {}
-
-        TKey min_key;
-        TKey max_key;
-    };
-
-    struct key_interval_comparator {
-        bool operator()(const key_interval &first, const key_interval &second) const {
-            return first.max_key < second.min_key;
-        }
-    };
-
     const TValue default_tvalue;
 
     const size_t block_size;
@@ -227,79 +215,94 @@ private:
 
     mutable file_block_handle loaded_block_handle;
 
-    std::map<key_interval, file_block *, key_interval_comparator> file_block_map;
+    std::map<TKey, file_block *> file_block_map;
 
     std::map<TKey, TValue> overflow;
 
-    void check_split_block(file_block *block) {
-        if (!block->needs_split()) return;
+    void check_split_block() {
+        if (!loaded_block->next) return;
+        if (!loaded_block->needs_split()) return;
 
-        auto new_block_handle = block->load().split_block();
-        auto entry = std::make_pair(
-                key_interval(new_block_handle.min_key(), new_block_handle.max_key()),
-                new_block_handle.get_block_ptr()
-        );
+        auto new_block_handle = loaded_block_handle.split_block();
+        auto entry = std::make_pair(new_block_handle.min_key(), new_block_handle.get_block_ptr());
         file_block_map.insert(entry);
+    }
+
+    void check_append_next() {
+        if (loaded_block->next) return;
+        if (!loaded_block->is_full()) return;
+
+        auto overflow_smallest_key = overflow.begin()->first;
+        if (overflow_smallest_key < loaded_block_handle.max_key()) return;
+
+        loaded_block->next = std::make_unique<file_block>(block_size);
+        loaded_block = loaded_block->next.get();
+        loaded_block_handle = loaded_block->load();
     }
 
     void check_flush_overflow() {
         if (overflow.size() < max_overflow_size) return;
 
         loaded_block = nullptr;
-        auto block_map_iterator = file_block_map.begin();
-        const TKey *next_block_min_key = nullptr;
 
         while (overflow.size() > 0) {
-            next_block_min_key = nullptr;
 
-            // Take the next file block out of the map
+            const TKey *next_block_min_key = nullptr;
+            auto overflow_smallest_key = overflow.begin()->first;
+            auto block_map_iterator = file_block_map.upper_bound(overflow_smallest_key);
+
+            // Take lower bound block out of the map
             if (block_map_iterator != file_block_map.end()) {
-                loaded_block = block_map_iterator->second;
-                file_block_map.erase(block_map_iterator);
+                if (block_map_iterator->second != first_file_block.get()) block_map_iterator--;
 
-                // Next Block - upper boundary for keys in this block + splitting
+                loaded_block = block_map_iterator->second;
+
+                // Next block min_key
                 auto copy = block_map_iterator;
-                if (++copy != file_block_map.end()) {
-                    next_block_min_key = &(copy->first.min_key);
-                    check_split_block(loaded_block);
+                if (++copy != file_block_map.end()) next_block_min_key = &(copy->first);
+
+                file_block_map.erase(block_map_iterator);
+            }
+
+                // No lower bound => select last file block
+            else {
+                if (!first_file_block) {
+                    first_file_block = std::make_unique<file_block>(block_size);
+                    loaded_block = first_file_block.get();
+                }
+                else {
+                    loaded_block = (--file_block_map.end())->second;
                 }
             }
 
-                // Create the next file block -- not the first file block
-            else if (loaded_block) {
-                loaded_block->next = std::make_unique<file_block>(block_size);
-                loaded_block = loaded_block->next.get();
-            }
-
-                // Create the next file block -- first file block
-            else {
-                first_file_block = std::make_unique<file_block>(block_size);
-                loaded_block = first_file_block.get();
-            }
-
-            // Load & merge values into the block
+            // Load block & check adding new blocks
             loaded_block_handle = loaded_block->load();
+            check_split_block();
+            check_append_next();
+
+            // Merge && Insert back into the map
             loaded_block_handle.merge_overflow(overflow, next_block_min_key);
-
-            auto entry = std::make_pair(
-                    key_interval(loaded_block_handle.min_key(), loaded_block_handle.max_key()),
-                    loaded_block
-            );
-
-            // Insert file block back into the file map
-            auto insert_result = file_block_map.insert(entry);
-            block_map_iterator = ++insert_result.first;
+            auto entry = std::make_pair(loaded_block_handle.min_key(), loaded_block);
+            file_block_map.insert(entry);
         }
     }
 
-    TValue &get_interval_value(const key_interval &ki) {
+    TValue &get_value(const TKey &key) {
         check_flush_overflow();
 
         // File Block lookup
-        auto file_block_it = file_block_map.find(ki);
+        auto file_block_it = file_block_map.upper_bound(key);
 
-        // No entry => Overflow
-        if (file_block_it == file_block_map.end()) return overflow[ki.min_key];
+        // No greater record found => return last block or overflow
+        if (file_block_it == file_block_map.end()) {
+            if (first_file_block) file_block_it = --file_block_map.end();
+            else return overflow[key];
+        }
+
+            // Return the preceding file block
+        else {
+            if (file_block_it->second != first_file_block.get()) file_block_it--;
+        }
 
         // Load file block
         if (loaded_block != file_block_it->second) {
@@ -308,22 +311,30 @@ private:
         }
 
         // Try get value from the file block (else overflow)
-        auto index = loaded_block_handle.find(ki.min_key);
+        auto index = loaded_block_handle.find(key);
 
-        if (index < 0) return overflow[ki.min_key];
+        if (index < 0) return overflow[key];
         else return loaded_block_handle[index].second;
     }
 
-    const TValue &get_interval_value(const key_interval &ki) const {
+    const TValue &get_value(const TKey &key) const {
 
         // File Block lookup
-        auto file_block_it = file_block_map.find(ki);
+        auto file_block_it = file_block_map.upper_bound(key);
 
-        // No entry => Overflow
+        // No greater record found => return last block or overflow
         if (file_block_it == file_block_map.end()) {
-            auto pos = overflow.find(ki.min_key);
-            if (pos != overflow.end()) return pos->second;
-            else return default_tvalue;
+            if (first_file_block) file_block_it = --file_block_map.end();
+            else {
+                auto pos = overflow.find(key);
+                if (pos != overflow.end()) return pos->second;
+                else return default_tvalue;
+            }
+        }
+
+            // Return the preceding file block
+        else {
+            if (file_block_it->second != first_file_block.get()) file_block_it--;
         }
 
         // Load file block
@@ -333,10 +344,10 @@ private:
         }
 
         // Try get value from the file block (else overflow)
-        auto index = loaded_block_handle.find(ki.min_key);
+        auto index = loaded_block_handle.find(key);
 
         if (index < 0) {
-            auto pos = overflow.find(ki.min_key);
+            auto pos = overflow.find(key);
             if (pos != overflow.end()) return pos->second;
             else return default_tvalue;
         }
@@ -373,11 +384,12 @@ public:
             if (take_from_overflow()) ++overflow_it;
 
                 // file
-            else if (++index >= loaded_block->get_size()) {
+            else if (++index == loaded_block->get_size()) {
                 index = 0;
                 loaded_block = loaded_block->next.get();
 
                 if (loaded_block) loaded_block_handle = loaded_block->load();
+                else loaded_block_handle = file_block_handle();
             }
         }
 
@@ -393,9 +405,10 @@ public:
         // Copy
         iterator(const iterator &other) : index(other.index),
                                           loaded_block(other.loaded_block),
-                                          loaded_block_handle(loaded_block->load()),
                                           overflow_it(other.overflow_it),
-                                          overflow_end(other.overflow_end) {}
+                                          overflow_end(other.overflow_end) {
+            if (loaded_block) loaded_block_handle = loaded_block->load();
+        }
 
         // Copy-Assignment
         iterator &operator=(const iterator &other) {
@@ -490,11 +503,12 @@ public:
             if (take_from_overflow()) ++overflow_it;
 
                 // file
-            else if (++index >= loaded_block->get_size()) {
+            else if (++index == loaded_block->get_size()) {
                 index = 0;
                 loaded_block = loaded_block->next.get();
 
                 if (loaded_block) loaded_block_handle = loaded_block->load();
+                else loaded_block_handle = file_block_handle();
             }
         }
 
@@ -510,9 +524,10 @@ public:
         // Copy
         const_iterator(const const_iterator &other) : index(other.index),
                                                       loaded_block(other.loaded_block),
-                                                      loaded_block_handle(loaded_block->load()),
                                                       overflow_it(other.overflow_it),
-                                                      overflow_end(other.overflow_end) {}
+                                                      overflow_end(other.overflow_end) {
+            if (loaded_block) loaded_block_handle = loaded_block->load();
+        }
 
         // Copy-Assign
         const_iterator &operator=(const const_iterator &other) {
@@ -579,7 +594,11 @@ public:
         }
     };
 
-    isam(size_t block_size, size_t overflow_size) :
+    isam(size_t
+         block_size,
+         size_t overflow_size
+    ) :
+
             block_size(block_size),
             max_overflow_size(overflow_size),
 
@@ -591,26 +610,22 @@ public:
             loaded_block(),
             loaded_block_handle() {}
 
-    ~isam() { first_file_block.release(); }
+    // ~isam() { first_file_block.release(); }
 
     TValue &operator[](const TKey &key) {
-        key_interval ki(key);
-        return get_interval_value(ki);
+        return get_value(key);
     }
 
     TValue &operator[](TKey &&key) {
-        key_interval ki(key);
-        return get_interval_value(ki);
+        return get_value(key);
     }
 
     const TValue &operator[](const TKey &key) const {
-        key_interval ki(key);
-        return get_interval_value(ki);
+        return get_value(key);
     }
 
     const TValue &operator[](TKey &&key) const {
-        key_interval ki(key);
-        return get_interval_value(ki);
+        return get_value(key);
     }
 
     iterator begin() {
@@ -630,6 +645,7 @@ public:
     const_iterator end() const {
         return const_iterator(overflow.end());
     }
+
 };
 
 #endif // ISAM_ISAM_HPP
